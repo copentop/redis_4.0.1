@@ -28,6 +28,19 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+/*
+ * Redis 内存管理
+ *
+ * redis为了方便内存的管理，在分配一块内存之后，会将这块内存的大小存入内存块的头部。
+ *
+ * 内存结构：
+ * 
+ * | 申请的内存块 size |  申请的内存块block |
+ *
+ *
+ * 
+ * 
+ */
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -45,6 +58,8 @@ void zlibc_free(void *ptr) {
 #include "zmalloc.h"
 #include "atomicvar.h"
 
+
+// 申请的内存块的大小，需求分配一个空间保存其内容
 #ifdef HAVE_MALLOC_SIZE
 #define PREFIX_SIZE (0)
 #else
@@ -55,36 +70,53 @@ void zlibc_free(void *ptr) {
 #endif
 #endif
 
+
+
 /* Explicitly override malloc/free etc when using tcmalloc. */
 #if defined(USE_TCMALLOC)
+
 #define malloc(size) tc_malloc(size)
 #define calloc(count,size) tc_calloc(count,size)
 #define realloc(ptr,size) tc_realloc(ptr,size)
 #define free(ptr) tc_free(ptr)
+
 #elif defined(USE_JEMALLOC)
+
 #define malloc(size) je_malloc(size)
 #define calloc(count,size) je_calloc(count,size)
 #define realloc(ptr,size) je_realloc(ptr,size)
 #define free(ptr) je_free(ptr)
 #define mallocx(size,flags) je_mallocx(size,flags)
 #define dallocx(ptr,flags) je_dallocx(ptr,flags)
+
 #endif
 
+// 统计增加已消耗的内存大小
 #define update_zmalloc_stat_alloc(__n) do { \
     size_t _n = (__n); \
     if (_n&(sizeof(long)-1)) _n += sizeof(long)-(_n&(sizeof(long)-1)); \
     atomicIncr(used_memory,__n); \
 } while(0)
 
+// 统计减少已消耗的内存大小
 #define update_zmalloc_stat_free(__n) do { \
     size_t _n = (__n); \
     if (_n&(sizeof(long)-1)) _n += sizeof(long)-(_n&(sizeof(long)-1)); \
     atomicDecr(used_memory,__n); \
 } while(0)
 
+
+// 已使用的内存
 static size_t used_memory = 0;
+
+// 内存锁
 pthread_mutex_t used_memory_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+ * 内容分配错误处理函数,打印分配内存信息
+ * 
+ * @return void
+ */
 static void zmalloc_default_oom(size_t size) {
     fprintf(stderr, "zmalloc: Out of memory trying to allocate %zu bytes\n",
         size);
@@ -94,18 +126,36 @@ static void zmalloc_default_oom(size_t size) {
 
 static void (*zmalloc_oom_handler)(size_t) = zmalloc_default_oom;
 
+
+/*
+ * 分配内存
+ *
+ * @return void *
+ */
 void *zmalloc(size_t size) {
+
+    // PREFIX_SIZE：申请的block这个内存块的大小
+    // 申请：该block的大小 + 内存block
     void *ptr = malloc(size+PREFIX_SIZE);
 
     if (!ptr) zmalloc_oom_handler(size);
+
 #ifdef HAVE_MALLOC_SIZE
     update_zmalloc_stat_alloc(zmalloc_size(ptr));
     return ptr;
 #else
+
+    // 申请的block起始地址
     *((size_t*)ptr) = size;
+
+    // 统计已分配消耗的内存
     update_zmalloc_stat_alloc(size+PREFIX_SIZE);
+
+    // 偏移到该block的起始地址
     return (char*)ptr+PREFIX_SIZE;
+
 #endif
+
 }
 
 /* Allocation and free functions that bypass the thread cache
@@ -126,6 +176,13 @@ void zfree_no_tcache(void *ptr) {
 }
 #endif
 
+
+
+/*
+ * 分配内存
+ *
+ * @return void *
+ */
 void *zcalloc(size_t size) {
     void *ptr = calloc(1, size+PREFIX_SIZE);
 
@@ -140,6 +197,12 @@ void *zcalloc(size_t size) {
 #endif
 }
 
+
+/*
+ * 分配内存
+ *
+ * @return void *
+ */
 void *zrealloc(void *ptr, size_t size) {
 #ifndef HAVE_MALLOC_SIZE
     void *realptr;
@@ -148,6 +211,8 @@ void *zrealloc(void *ptr, size_t size) {
     void *newptr;
 
     if (ptr == NULL) return zmalloc(size);
+
+
 #ifdef HAVE_MALLOC_SIZE
     oldsize = zmalloc_size(ptr);
     newptr = realloc(ptr,size);
@@ -157,6 +222,7 @@ void *zrealloc(void *ptr, size_t size) {
     update_zmalloc_stat_alloc(zmalloc_size(newptr));
     return newptr;
 #else
+
     realptr = (char*)ptr-PREFIX_SIZE;
     oldsize = *((size_t*)realptr);
     newptr = realloc(realptr,size+PREFIX_SIZE);
@@ -165,24 +231,43 @@ void *zrealloc(void *ptr, size_t size) {
     *((size_t*)newptr) = size;
     update_zmalloc_stat_free(oldsize);
     update_zmalloc_stat_alloc(size);
+
+    
     return (char*)newptr+PREFIX_SIZE;
 #endif
+
 }
 
+
+/*
+ * 计算分配的内存大小：block + 该block的大小
+ *
+ * @return size_t
+ */
 /* Provide zmalloc_size() for systems where this function is not provided by
  * malloc itself, given that in that case we store a header with this
  * information as the first bytes of every allocation. */
 #ifndef HAVE_MALLOC_SIZE
 size_t zmalloc_size(void *ptr) {
+    // 偏移到整块的起始
     void *realptr = (char*)ptr-PREFIX_SIZE;
+    // 实际大小
     size_t size = *((size_t*)realptr);
+
+
     /* Assume at least that all the allocations are padded at sizeof(long) by
      * the underlying allocator. */
     if (size&(sizeof(long)-1)) size += sizeof(long)-(size&(sizeof(long)-1));
+
     return size+PREFIX_SIZE;
 }
 #endif
 
+/*
+ * 释放内存空间
+ *
+ * @return void
+ */
 void zfree(void *ptr) {
 #ifndef HAVE_MALLOC_SIZE
     void *realptr;
@@ -190,10 +275,14 @@ void zfree(void *ptr) {
 #endif
 
     if (ptr == NULL) return;
+
+
 #ifdef HAVE_MALLOC_SIZE
     update_zmalloc_stat_free(zmalloc_size(ptr));
     free(ptr);
 #else
+
+
     realptr = (char*)ptr-PREFIX_SIZE;
     oldsize = *((size_t*)realptr);
     update_zmalloc_stat_free(oldsize+PREFIX_SIZE);
@@ -201,6 +290,12 @@ void zfree(void *ptr) {
 #endif
 }
 
+/*
+ * 复制字符串
+ *
+ * @return char *
+ * 
+ */
 char *zstrdup(const char *s) {
     size_t l = strlen(s)+1;
     char *p = zmalloc(l);
@@ -209,12 +304,21 @@ char *zstrdup(const char *s) {
     return p;
 }
 
+
+/*
+ * 内存已使用的大小
+ * 
+ */
 size_t zmalloc_used_memory(void) {
     size_t um;
     atomicGet(used_memory,um);
     return um;
 }
 
+/*
+ * 设置超出内存的错误处理函数
+ * 
+ */
 void zmalloc_set_oom_handler(void (*oom_handler)(size_t)) {
     zmalloc_oom_handler = oom_handler;
 }
@@ -238,25 +342,32 @@ void zmalloc_set_oom_handler(void (*oom_handler)(size_t)) {
 size_t zmalloc_get_rss(void) {
     int page = sysconf(_SC_PAGESIZE);
     size_t rss;
+
     char buf[4096];
     char filename[256];
     int fd, count;
+
     char *p, *x;
 
     snprintf(filename,256,"/proc/%d/stat",getpid());
+
     if ((fd = open(filename,O_RDONLY)) == -1) return 0;
+
     if (read(fd,buf,4096) <= 0) {
         close(fd);
         return 0;
     }
+
     close(fd);
 
     p = buf;
     count = 23; /* RSS is the 24th field in /proc/<pid>/stat */
+
     while(p && count--) {
         p = strchr(p,' ');
         if (p) p++;
     }
+
     if (!p) return 0;
     x = strchr(p,' ');
     if (!x) return 0;
@@ -266,6 +377,7 @@ size_t zmalloc_get_rss(void) {
     rss *= page;
     return rss;
 }
+
 #elif defined(HAVE_TASKINFO)
 #include <unistd.h>
 #include <stdio.h>
@@ -296,6 +408,8 @@ size_t zmalloc_get_rss(void) {
     return zmalloc_used_memory();
 }
 #endif
+
+
 
 /* Fragmentation = RSS / allocated-bytes */
 float zmalloc_get_fragmentation_ratio(size_t rss) {
@@ -348,6 +462,7 @@ size_t zmalloc_get_smap_bytes_by_field(char *field, long pid) {
 }
 #endif
 
+
 size_t zmalloc_get_private_dirty(long pid) {
     return zmalloc_get_smap_bytes_by_field("Private_Dirty:",pid);
 }
@@ -366,16 +481,24 @@ size_t zmalloc_get_private_dirty(long pid) {
  * 4) This note exists in order to comply with the original license.
  */
 size_t zmalloc_get_memory_size(void) {
+
+// if 1
 #if defined(__unix__) || defined(__unix) || defined(unix) || \
     (defined(__APPLE__) && defined(__MACH__))
+
+// if 2
 #if defined(CTL_HW) && (defined(HW_MEMSIZE) || defined(HW_PHYSMEM64))
     int mib[2];
     mib[0] = CTL_HW;
+
+// if 3
 #if defined(HW_MEMSIZE)
     mib[1] = HW_MEMSIZE;            /* OSX. --------------------- */
 #elif defined(HW_PHYSMEM64)
     mib[1] = HW_PHYSMEM64;          /* NetBSD, OpenBSD. --------- */
 #endif
+// end if 3
+
     int64_t size = 0;               /* 64-bit */
     size_t len = sizeof(size);
     if (sysctl( mib, 2, &size, &len, NULL, 0) == 0)
@@ -390,22 +513,30 @@ size_t zmalloc_get_memory_size(void) {
     /* DragonFly BSD, FreeBSD, NetBSD, OpenBSD, and OSX. -------- */
     int mib[2];
     mib[0] = CTL_HW;
+
+// if 4
 #if defined(HW_REALMEM)
     mib[1] = HW_REALMEM;        /* FreeBSD. ----------------- */
 #elif defined(HW_PYSMEM)
     mib[1] = HW_PHYSMEM;        /* Others. ------------------ */
 #endif
+// end if 4
     unsigned int size = 0;      /* 32-bit */
     size_t len = sizeof(size);
     if (sysctl(mib, 2, &size, &len, NULL, 0) == 0)
         return (size_t)size;
     return 0L;          /* Failed? */
-#else
+
+#else // else if 2
     return 0L;          /* Unknown method to get the data. */
 #endif
-#else
+// end if 2
+
+#else // else if 1
     return 0L;          /* Unknown OS. */
 #endif
+// end if 1
+    
 }
 
 
